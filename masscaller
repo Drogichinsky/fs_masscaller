@@ -1,0 +1,212 @@
+#!/usr/bin/perl
+use AnyEvent::RabbitMQ;
+use Data::Dumper;
+use JSON;
+use DBI;
+use DateTime;
+use DateTime::Format::ISO8601;
+use DateTime::Duration;
+#require "readcfg_ac.pm";
+#use readcfgacmc;
+use readcfg;
+
+
+my $dbh = DBI->connect('dbi:Pg:dbname=freeswitchdb;host=127.0.0.1','postgres','',{AutoCommit=>1,RaiseError=>1,PrintError=>0});
+
+
+
+if ($DBI::err != 0) {
+  print $DBI::errstr . "\n";
+  exit($DBI::err);
+}
+# @ar - массив переменных конфига
+print "\n================= MASSCALL CONSUME ABILYTY ANALYZE =================\n";
+
+#$name = $ARGV[0] or die "Need to point a name on the command line\n";
+$mconf_id = $ARGV[0] or die "Need a mconf_id as argument\n";
+
+#if ($mconf_id)
+$agent_count = 0;
+readcfg::readcfg_mc($mconf_id);
+
+#print "timezone $time_zone\n";
+
+# ---------------- readed to vars from masscall_conf
+#$domain = $readcfg::domain;
+$note = $readcfg::note;
+$userfield = $readcfg::userfield;
+$autocall_id = $readcfg::autocall_id;
+$context = $readcfg::context;
+#$time_zone = $readcfg::time_zone;
+
+readcfg::readcfg_mcac($autocall_id);
+
+# ---------------- readed to vars from autocall_conf
+$ac_name = $readcfg::ac_name;
+$callback_ext = $readcfg::callback_ext;
+$callback_queue = $readcfg::callback_queue;
+$wait_time = $readcfg::wait_time;
+$deltas_after_hours = $readcfg::deltas_after_hours;
+$context = $readcfg::context;
+$note = $readcfg::note;
+$trunk = $readcfg::trunk;
+$free_agents = $readcfg::free_agents;
+$max_call_tries = $readcfg::max_call_tries;
+$max_call_tries--;
+$time_zone = $readcfg::time_zone;
+$time_between_call_tries = $readcfg::time_between_call_tries;
+# -------------------------------------------------
+$DateTimeNow = DateTime->now(time_zone => $time_zone); # берем настоящее время
+$dt = DateTime::Format::ISO8601->parse_datetime($DateTimeNow);
+$DateTimeNowWOT = time_minus_T($dt);
+@DateTimeNowSplitted = split(/T/,$dt); # сплиттим  на дату и время
+print "Time now: @DateTimeNowSplitted";
+
+my $dt_duration = DateTime::Duration->new(minutes => -$time_between_call_tries);
+my $dt2 = $dt + $dt_duration;
+$DateTimeNowWOT2 = time_minus_T($dt2);
+print "\nOffseted DT: $DateTimeNowWOT2";
+
+$ready_agents_count = free_agents_by_tier($callback_queue."@".$context);
+print "\nOnline agents count: $ready_agents_count\n\n";
+
+$query_catch = "select context, caller_id_number, callback_tries, callback_last_try_time, callback_status from masscall where mconf_id = '".$mconf_id."'
+ and (callback_status != 'answered' or callback_status IS NULL) and callback_tries <= ".$max_call_tries." and callback_last_try_time < '".$DateTimeNowWOT2."' order by callback_tries asc limit ". $ready_agents_count.";";
+$query = $query_catch;
+print "$query\n\n";
+$sth = $dbh->prepare($query);
+$rv = $sth->execute();
+#$todo = 0;
+
+while (@ar = $sth->fetchrow_array()) {
+  print "Prepare call to: \n";
+  foreach $i (@ar) {
+    print "$i\t";
+     };
+    #  print "\n@ar[7]\n";
+    #$context = @ar[0];
+    $caller_id_number = @ar[1];
+    $callback_tries = @ar[2];
+    $callback_last_try_time = @ar[3];
+    $callback_status = @ar[4];
+
+     if (@ar[3]) # Если есть callback_last_try_time
+     {
+     $ss = @ar[3];
+     $time_from_base = time_plus_T($ss); # добавляем T
+     print "\nTime from base: $time_from_base";
+     my $min_duration = DateTime::Duration->new(minutes => -$time_between_call_tries);
+     $DateTimeNow = $dt;
+     print "\nDateTimeNow = $DateTimeNow";
+     $dt = $dt + $min_duration; #delta
+     print "\nDelta Full: $dt";
+     $dt = DateTime::Format::ISO8601->parse_datetime($dt);
+     $delta_minute = $dt->minute;
+    print "\ndelta minute: $delta_minute";
+    }
+    else {$delta_minute = $time_between_call_tries};
+    if (($delta_minute >= $time_between_call_tries) and (@ar[4] ne 'answered') and (@ar[4] ne 'calling') ) # если дельта от последнего звонка больше чем $time_between_call_tries и в данный момент не статус answering, идем дальше на запуск нового коллбэка
+      {
+        print "\n\n<======= MASSCALL ORIGINATE =======> \n\n";
+
+        #$query_set_answer = "update losecall set callback_tries = callback_tries + 1, callback_status = 'calling', callback_last_try_time = '".$DateTimeNowWOT."' where uuid = '".$uuid."';";
+        $query_set_answer = "update masscall set callback_tries = callback_tries + 1, callback_last_try_time = '".$DateTimeNowWOT."' where caller_id_number = '".$caller_id_number."';";
+        $query = $query_set_answer;
+        print "$query\n";
+        $sth1 = $dbh->prepare($query);
+        $rv1 = $sth1->execute();
+        #$cmd = "commandBindingKey "."'originate user/".$caller_id_number."\@".$context." ".$destination_number." xml ".$context."'";
+        $cmd = "commandBindingKey "."'originate {ignore_early_media=true}sofia/gateway/".$trunk."/".$caller_id_number." ".$callback_ext." xml ".$context."'";
+        print "\nOriginate thru amqp: $cmd\n";
+        system ("/usr/local/sbin/fs/amqp_command $cmd");
+        print "<======= END OF MASSCALL ORIGINATE =======> \n";
+      }
+
+     #};
+    print "\n";
+#    $todo = 1;
+};
+
+#while (@ar = $sth->fetchrow_array()) {
+#  foreach $i (@ar) {
+#    print "$i\t";
+#      #@fails[$j] = @ar[0]; # src
+#      #@fails1[$j] = @ar[1]; # dst
+#     };
+#   $j++;
+#    print "\n";
+#};
+
+sub time_plus_T {
+  $t1 = $_[0];
+  $t1 =~ s/\s/T/g;
+  $t = DateTime::Format::ISO8601->parse_datetime($t1);
+return $t;
+}
+
+sub time_minus_T {
+  $t1 = $_[0];
+  $t1 =~ s/T/ /g;
+  return $t1;
+}
+
+sub free_agents_by_tier {
+  $queue = $_[0]; #$qnum = $_[1];
+  print "\nqueue: $queue";
+my @sysres = `/usr/local/sbin/fs/simple0 'callcenter_config queue list tiers $queue'`;
+  my $j=0;
+  foreach $ss (@sysres)
+  {
+    chomp ($ss); #print "\nss = $ss\n";
+      if ($ss =~ /$queue/)
+    {
+      $sss = $';
+      $b = $&;
+      if (($sss =~ /Ready/))
+      {
+        $a_avail = false;
+        $agent = $`;
+        $agent =~ s/\|//g;
+        print "\nReady agent: $agent";
+        $a_avail = avail_agent($agent);
+        #print "\na_avail = $a_avail\n";
+        if ($a_avail eq true) {$j++;};
+    }
+  }
+  }
+return $j;
+}
+
+sub avail_agent {
+  my $agent = $_[0];
+  my @sysres = `/usr/local/sbin/fs/simple0 'callcenter_config agent get status $agent'`;
+
+  $a_waiting1 = false;
+  foreach $ss (@sysres)
+  {
+    chomp ($ss); #print "\nss = $ss\n";
+      if ($ss =~ /Available/)
+    {
+    $a_waiting1 = waiting_agent($agent);
+    print  "\nAvailable agent: $agent $a_waiting1";
+  }
+}
+return $a_waiting1;
+}
+
+sub waiting_agent {
+  my $agent = $_[0];
+  my @sysres = `/usr/local/sbin/fs/simple0 'callcenter_config agent get state $agent'`;
+$a_waiting = false;
+  foreach $ss (@sysres)
+  {
+    chomp ($ss); #print "\nss = $ss\n";
+      if ($ss =~ /Waiting/)
+    {
+    #$agent_count++;
+    $a_waiting = true;
+    print  "\nWaiting agent: $agent $a_waiting";
+  }
+}
+return $a_waiting;
+}

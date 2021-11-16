@@ -1,0 +1,187 @@
+#!/usr/bin/perl
+# lcproduce is lose call catch from cdr and produce it to call queue table losecall
+use DBI;
+use DateTime;
+use DateTime::Format::ISO8601;
+use readcfg;
+#require "/usr/local/sbin/fs/readcfg.pm";
+my $dbh = DBI->connect('dbi:Pg:dbname=freeswitchdb;host=127.0.0.1','postgres','',{AutoCommit=>1,RaiseError=>1,PrintError=>0});
+
+
+if ($DBI::err != 0) {
+  print $DBI::errstr . "\n";
+  exit($DBI::err);
+}
+
+$name = $ARGV[0];
+
+readcfg::readcfg1($name);
+
+$dst_num = $readcfg::dst_num;
+$free_period = $readcfg::free_period;
+$time2past = $readcfg::time2past;
+$note = $readcfg::note;
+$autocall = $readcfg::autocall;
+$context = $readcfg::context;
+$fail_causes = $readcfg::fail_causes;
+$orderlc = $readcfg::orderlc;
+$time_zone = $readcfg::time_zone;
+$sip_to_user = $readcfg::sip_to_user;
+
+$DateTimeNow = DateTime->now(time_zone => $time_zone); # берем настоящее время
+$dt = DateTime::Format::ISO8601->parse_datetime($DateTimeNow);
+my $dt_duration = DateTime::Duration->new(hours => -$time2past);
+my $dt2 = $dt + $dt_duration;
+#print "\n $dt $dt_duration $dt2";
+@DateTimeEndSplitted = split(/T/,$dt); # сплиттим  на дату и время
+@DateTimeStartSplitted = split(/T/,$dt2);
+$EndDateTime = @DateTimeEndSplitted[0]." ".@DateTimeEndSplitted[1];
+$StartDateTime = @DateTimeStartSplitted[0]." ".@DateTimeStartSplitted[1];
+print "\nStart $StartDateTime End $EndDateTime\n";
+
+if ($DBI::err != 0) {
+  print $DBI::errstr . "\n";
+  exit($DBI::err);
+}
+# @ar - массив переменных конфига
+print "\n================= LOSECALL PRODUCE BEGIN =================\n";
+
+$fail_causes =~ s/\\047/'/g; # восстанавливаем кавычки
+$dst_num =~ s/\\047/'/g; # восстанавливаем кавычки
+print "\nFail causes as simple_cause: $fail_causes\n";
+print "Catchin dst_nums: $dst_num\n";
+# выбираем все неудачные звонки из заданного периода cdr
+$query_catch_fails_init = "select * from (select caller_id_number, destination_number, case when bleg_uuid IS NULL then 'fail' else 'good' end
+ as simple_cause from cdr where sip_to_user = '".$sip_to_user."' and context = '".$context."' and destination_number in (".$dst_num.") and ((start_stamp < '".$EndDateTime."') and (start_stamp > '".$StartDateTime."'))
+ group by caller_id_number, destination_number, simple_cause) as foo where simple_cause = 'fail';";
+$query = $query_catch_fails_init;
+print "\n$query\n";
+$sth0 = $dbh->prepare($query);
+$rv0 = $sth0->execute();
+
+$j=0;
+print "Failed calls by simple_cause:\n";
+while (@ar0 = $sth0->fetchrow_array()) {
+  foreach $i (@ar0) {
+    print "$i\t";
+      @fails[$j] = @ar0[0]; # src
+      @fails1[$j] = @ar0[1]; # dst
+     };
+   $j++;
+    print "\n";
+};
+#print "@fails\n@fails1\n";
+# удаляем то что вне диапазона периода времени
+$query_del_off_time = "delete from losecall where start_stamp < '".$StartDateTime."';";
+$query = $query_del_off_time;
+print "\n$query\n";
+$sth1 = $dbh->prepare($query);
+$rv1 = $sth1->execute();
+
+$k=0;
+foreach (@fails) {
+  $src = @fails[$k];
+  $dst = @fails1[$k];
+  $k++;
+# Выявляем из них какой последний фейл cdr
+  $query_catch = "select id, uuid, caller_id_number, destination_number, sip_to_user, context, start_stamp, direction, hangup_cause,
+                  case when bleg_uuid IS NULL then 'fail' else 'good' end as simple_cause from cdr
+                  where ((sip_to_user = '".$sip_to_user."') or (sip_to_user = '".$src."')) and context = '".$context."' and caller_id_number = '".$src."' and destination_number = '".$dst."' group by uuid, simple_cause, caller_id_number,
+                  start_stamp, id, destination_number, sip_to_user, context, direction, hangup_cause order by start_stamp desc limit 1;";
+  $query = $query_catch;
+  print "\n$query\n";
+  $sth = $dbh->prepare($query);
+  $rv = $sth->execute();
+
+$j=0;
+#print "\n@ar\n";
+  while (@ar = $sth->fetchrow_array()) {
+    foreach $i (@ar) {
+      print "$i\t";
+    }
+    print "\n";
+      #$query_from_lc = "select * from losecall where caller_id_number = '".@ar[2]."' and sip_to_user = '".@ar[5]."';";
+      $query_from_lc = "select * from losecall where ((sip_to_user = '".$sip_to_user."') or (sip_to_user = '".$src."')) and caller_id_number = '".@ar[2]."' and destination_number = '".@ar[3]."';";
+      $query = $query_from_lc;
+      print "\n$query\n";
+      $sth1 = $dbh->prepare($query);
+      $rv1 = $sth1->execute();
+      @ar1 = $sth1->fetchrow_array();
+      print "\n!ar1 = @ar1\n";
+      if (@ar[9] eq 'fail' and $j==0) {
+        #print "@ar\necid: @ar[3]";
+        if (@ar1)
+        {
+          if ((@ar[6] ne @ar1[7]) and (@ar[6] ne @ar1[11])) { # апдейтим ласт таймстамп от дубликата - несвежего неотвеченного
+                        #$query_start_stamp_update = "update losecall set start_stamp_last = '".@ar[7]."', call_count = call_count + 1 where caller_id_number = '".@ar[2]."' and sip_to_user = '".@ar[5]."';";
+                        $query_start_stamp_update = "update losecall set start_stamp_last = '".@ar[6]."', call_count = call_count + 1 where caller_id_number = '".@ar[2]."' and destination_number = '".@ar[3]."';";
+                        $query = $query_start_stamp_update;
+                        print "\n$query\n";
+                        $sth1 = $dbh->prepare($query);
+                        $rv1 = $sth1->execute();
+                              }
+            #print "\n";
+        }
+        else
+        { # если свежий неотвеченный, добавляем в очередь
+          $query_insert_lose = "INSERT INTO losecall (cdr_id, uuid, caller_id_number, destination_number, sip_to_user, context, start_stamp, direction, hangup_cause, call_count, callback_tries)
+                                          VALUES ('".@ar[0]."','".@ar[1]."','".@ar[2]."','".@ar[3]."','".@ar[4]."','".@ar[5]."','".@ar[6]."','".@ar[7]."','".@ar[8]."',1,0);";
+          $query = $query_insert_lose;
+          print "\n$query\n";
+          $sth2 = $dbh->prepare($query);
+          $rv2 = $sth2->execute();
+          $sth2->finish();
+        }
+        }
+      if (@ar[9] eq 'good' and $j==0) { # если есть подобный отвеченный, удаляем из очереди
+      print "\n-------!!!!!!!!!!!!!!-----\n";
+      print "\nar1 = @ar1\n";
+        if (@ar1)
+        {
+
+          print "\n!!!!!!!!!!!!!!\n";
+                    #$query_delete_lose = "delete from losecall where caller_id_number = '".@ar[2]."' and sip_to_user = '".@ar[5]."';";
+                    $query_delete_lose = "delete from losecall where ((sip_to_user = '".$sip_to_user."') or (sip_to_user = '".$src."')) and caller_id_number = '".@ar[2]."' and destination_number = '".@ar[3]."';";
+                    $query = $query_delete_lose;
+                    print "\n$query\n";
+                    $sth2 = $dbh->prepare($query);
+                    $rv2 = $sth2->execute();
+                    $sth2->finish();
+          }
+        }
+    #}
+$j++;
+
+}
+            }
+
+$sth->finish();
+$sth1->finish();
+
+$dbh->disconnect();
+print "\n================= LOSECALL PRODUCE END =================\n";
+#----------------------------------------------------
+#----------------------------------------------------
+sub exec_query {
+  $query = $_[0];
+  #print "\n$query\n";
+$sth = $dbh->prepare($query);
+$rv = $sth->execute();
+if (!defined $rv) {
+  print "При выполнении запроса '$query' возникла ошибка: " . $dbh->errstr . "\n";
+  exit(0);
+}
+return $sth;
+}
+
+sub exec_query1 {
+  $query = $_[0];
+  #print "\n$query\n";
+$sth1 = $dbh->prepare($query);
+$rv1 = $sth1->execute();
+if (!defined $rv1) {
+  print "При выполнении запроса '$query' возникла ошибка: " . $dbh->errstr . "\n";
+  exit(0);
+}
+return $sth1;
+}
