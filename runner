@@ -1,0 +1,261 @@
+#!/usr/bin/perl
+use AnyEvent::RabbitMQ;
+use Data::Dumper;
+use JSON;
+use DBI;
+use DateTime;
+use DateTime::Format::ISO8601;
+use DateTime::Duration;
+#require "readcfg_ac.pm";
+#use readcfg;
+use threads;
+require "/usr/local/sbin/fs/readcfg.pm";
+require "/usr/local/sbin/fs/dater.pm";
+my $dbh = DBI->connect('dbi:Pg:dbname=freeswitchdb;host=127.0.0.1','postgres','',{AutoCommit=>1,RaiseError=>1,PrintError=>0});
+
+
+
+if ($DBI::err != 0) {
+  print $DBI::errstr . "\n";
+  exit($DBI::err);
+};
+
+deferred_call();
+masscall();
+losecall();
+
+sub check_ac {
+  $id = $_[0];
+  my $query_catch = "select id, time_zone, time_period from autocall_conf where id = ".$id.";";
+  my $query = $query_catch;
+  print "$query\n";
+  my $sth = $dbh->prepare($query);
+  my $rv = $sth->execute();
+
+  while (@ar = $sth->fetchrow_array()) {
+    foreach $i (@ar) {
+      print "$i\t";
+       };
+ $id = @ar[0];
+ my $time_zone = @ar[1];
+ my $time_period = @ar[2];
+
+ $indate_flag = dater::indate($id);
+ if ($indate_flag = 1)
+    {
+   print "\n*********************************** ac id in date = $id\n";
+   #my $thr = threads->create('thread_auto_call', $id);
+
+    }
+     }
+     return $indate_flag;
+}
+
+sub deferred_call {
+
+  my $query_catch = "select id, deferred_id, destination, destination_type, callee_type, domain, call_time, number, time_zone, status, trunk, call_time_delta from deferred_call where status != 'originate_success' or status != 'answered'  or status != 'overdue' or status is NULL;";
+  my $query = $query_catch;
+  print "$query\n";
+  my $sth = $dbh->prepare($query);
+  my $rv = $sth->execute();
+
+  while (@ar = $sth->fetchrow_array()) {
+    foreach $i (@ar) {
+      print "$i\t";
+       };
+       my $id = @ar[0];
+       my $def_id = @ar[1];
+       my $destination = @ar[2];
+       my $destination_type = @ar[3];
+       my $calee_type = @ar[4];
+       my $domain = @ar[5];
+       my $call_time = @ar[6];
+       my $call_timeWT = time_plus_T($call_time);
+       my $number = @ar[7];
+       my $time_zone = @ar[8];
+       my $status = @ar[9];
+       #my $trunk = @ar[10];
+       my $call_time_delta = @ar[11];
+       if ($status ne 'originate_success' and $status ne 'answered')
+       {
+         my $trunk = get_trunk($domain);
+       my $DateTimeNow = DateTime->now(time_zone => $time_zone); # берем настоящее время
+       my $dt = DateTime::Format::ISO8601->parse_datetime($DateTimeNow);
+       print "\ncall_time_delta = $call_time_delta\n";
+       my $min_duration = DateTime::Duration->new(minutes => -$call_time_delta);
+       $dt1 = $dt + $min_duration;
+        print "\ncall_timeWT = $call_timeWT dt1 = $dt1 dt = $dt\n";
+      if (($call_timeWT > $dt1) and ($call_timeWT < $dt))
+      {
+       print "\nRun deferred_call with id = $id\n";
+         my $thr = threads->create('thread_deferred_call', ($id, $def_id, $destination, $destination_type, $calee_type, $number, $domain, $trunk, $time_zone));
+
+      }
+      if (($call_timeWT < $dt) and ($call_timeWT < $dt1))
+      {
+        my $query_set_answer = "update deferred_call set status = 'overdue' where deferred_id = '".$def_id."';";
+        my $query = $query_set_answer;
+        print "$query\n";
+        my $sth = $dbh->prepare($query);
+        my $rv = $sth->execute();
+      }
+  }
+}
+}
+
+sub losecall {
+
+my $query_catch = "select id, autocall_id from losecall_conf;";
+my $query = $query_catch;
+print "$query\n";
+my $sth = $dbh->prepare($query);
+my $rv = $sth->execute();
+my @thread_ar = ();
+while (@ar = $sth->fetchrow_array()) {
+  foreach $i (@ar) {
+    print "$i\t";
+     };
+     my $id = @ar[0];
+     my $autocall_id = @ar[1];
+     $ac_flag = check_ac($autocall_id);
+
+     my $thr1 = threads->create('thread_lcproduce', $id);
+     push @thread_ar1, $thr1;
+
+     if ( $ac_flag = 1)
+{
+     print "\nRUn losecall caller with id = $id\n";
+     my $thr = threads->create('thread_losecall', $id);
+     push @thread_ar, $thr;
+
+     print "\nthr = $thr\n";
+      #system ("/usr/local/sbin/fs/masscaller $id >> /var/log/masscaller.log");
+    }
+};
+foreach $ta1(@thread_ar1)
+{
+$ta1->join();
+}
+
+foreach $ta(@thread_ar)
+{
+$ta->join();
+}
+};
+
+sub thread_losecall {
+my $id = shift @_;
+#system ("/usr/local/sbin/fs/caller $arg >> /var/log/caller.log");
+print "\n----------------------------------RUN losecall $id\n";
+system ("/usr/local/sbin/fs/caller $id >> /var/log/caller.log");
+};
+
+sub thread_lcproduce {
+my $id = shift @_;
+#system ("/usr/local/sbin/fs/caller $arg >> /var/log/caller.log");
+print "\n----------------------------------RUN lcproduce $id\n";
+system ("/usr/local/sbin/fs/lcproduce $id >> /var/log/lcproduce.log");
+};
+
+sub masscall {
+
+my $query_catch = "select id, autocall_id from masscall_conf where status = 1;";
+my $query = $query_catch;
+print "$query\n";
+my $sth = $dbh->prepare($query);
+my $rv = $sth->execute();
+my @thread_ar = ();
+while (@ar = $sth->fetchrow_array()) {
+  foreach $i (@ar) {
+    print "$i\t";
+     };
+     my $id = @ar[0];
+     my $autocall_id = @ar[1];
+     $ac_flag = check_ac($autocall_id);
+     if ( $ac_flag = 1)
+{
+     print "\nRUn masscall with id = $id\n";
+     my $thr = threads->create('thread_masscall', $id);
+     push @thread_ar, $thr;
+
+     print "\nthr = $thr\n";
+      #system ("/usr/local/sbin/fs/masscaller $id >> /var/log/masscaller.log");
+    }
+};
+foreach $ta(@thread_ar)
+{
+$ta->join();
+}
+
+};
+
+sub thread_masscall {
+$id = shift @_;
+#system ("/usr/local/sbin/fs/caller $arg >> /var/log/caller.log");
+print "\n----------------------------------RUN masscall $id\n";
+system ("/usr/local/sbin/fs/masscaller $id >> /var/log/masscaller.log");
+};
+
+
+sub thread_deferred_call {
+($id, $def_id, $destination, $destination_type, $calee_type, $number, $domain, $trunk, $time_zone) = @_;
+my $wait_time = 30;
+if ($calee_type eq 'lead')
+  {$src_part = "}sofia/gateway/".$trunk."/";}
+  elsif ($calee_type eq 'being')
+  {$src_part = "}user/";}
+print "\nrunner destination_type = $destination_type\n";
+  if ($destination_type eq 'queue')
+  {
+  $cmdesl = "originate {deferred_id=".$def_id.",ignore_early_media=true,originate_timeout=".$wait_time.$src_part.$number." &callcenter(".$destination."@".$domain.")";
+  }
+  elsif($destination_type eq 'ivr')
+  {
+  #$cmdesl = "originate {execute_on_media=start_dtmf,deferred_id=".$def_id.",ignore_early_media=true,originate_timeout=".$wait_time.$src_part.$number." &ivr(".$destination.")";
+  $cmdesl = "originate {deferred_id=".$def_id.",ignore_early_media=true,originate_timeout=".$wait_time.$src_part.$number." &ivr(".$destination.")";
+  }
+  elsif ($destination_type eq 'number')
+  {
+  $cmdesl = "originate {deferred_id=".$def_id.",ignore_early_media=true,originate_timeout=".$wait_time.$src_part.$number." &bridge(verto.rtc/".$destination."@".$domain.",user/".$destination."@".$domain.")";
+  }
+print "\nrunner cmdesl = $cmdesl\n";
+system ("/usr/local/sbin/fs/originator_dc '".$cmdesl."' '".$time_zone."' '".$def_id."'");
+};
+
+
+sub time_plus_T {
+  $t1 = $_[0];
+  $t1 =~ s/\s/T/g;
+  $t = DateTime::Format::ISO8601->parse_datetime($t1);
+return $t;
+}
+
+sub time_minus_T {
+  $t1 = $_[0];
+  $t1 =~ s/T/ /g;
+  return $t1;
+}
+
+sub get_trunk {
+my $domain = $_[0];
+my @sysres = `/usr/local/sbin/fs/simple0 'sofia profile external gwlist'`;
+  my $j=0;
+  foreach $ss (@sysres)
+  {
+    chomp ($ss); #print "\nss = $ss\n";
+    $ss =~ s/\s//g;
+    if ($ss =~ /trunk_/)
+    {
+      my $trunk = $ss;
+      $ss = $';
+      $ss =~ s/\_/./g;
+      print "\n TRUNK $ss domain $domain\n;";
+      if ($ss =~ /$domain/)
+      {
+        print "\n true\n;";
+        return $trunk;
+      }
+
+    }
+}
+}
